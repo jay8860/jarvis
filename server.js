@@ -199,6 +199,8 @@ FORMATTING:
     const { data } = await axios.post(url, {
       system_instruction: { parts: [{ text: systemText }] },
       contents,
+      tools: [{ googleSearch: {} }],
+      tools: [{ googleSearch: {} }],
       generationConfig: {
         temperature: 0.85,
         maxOutputTokens: 1024,
