@@ -1,36 +1,65 @@
 require('dotenv').config();
-const express = require('express');
+const express  = require('express');
 const { google } = require('googleapis');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const axios = require('axios');
-const path = require('path');
+const axios    = require('axios');
+const path     = require('path');
+const fs       = require('fs');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json({ limit: '4mb' }));
 
-// ─── GOOGLE OAUTH2 (Gmail) ────────────────────────────────────────────────────
-const REDIRECT_URI =
-  process.env.GOOGLE_REDIRECT_URI ||
-  `http://localhost:${PORT}/auth/callback`;
+// ─── MEMORY FILE ─────────────────────────────────────────────────────────────
+const MEMORY_FILE = path.join('/tmp', 'jarvis_memory.json');
+function loadMemory() {
+  try { return JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8')); }
+  catch { return { facts: [], lastSeen: null }; }
+}
+function saveMemory(data) {
+  try { fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2)); } catch {}
+}
 
+// ─── SSE CLIENTS (for reminders push) ────────────────────────────────────────
+const sseClients = new Map();
+let reminders    = [];
+
+function pushEvent(data) {
+  sseClients.forEach(res => {
+    try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
+  });
+}
+
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  res.write('data: {"type":"connected"}\n\n');
+  const id = Date.now();
+  sseClients.set(id, res);
+  req.on('close', () => sseClients.delete(id));
+});
+
+// ─── GOOGLE OAUTH2 ────────────────────────────────────────────────────────────
+const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `http://localhost:${PORT}/auth/callback`;
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
   REDIRECT_URI
 );
-
 if (process.env.GOOGLE_REFRESH_TOKEN) {
   oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 }
 
 app.get('/auth/google', (_req, res) => {
   const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    scope: ['https://www.googleapis.com/auth/gmail.readonly'],
+    access_type: 'offline', prompt: 'consent',
+    scope: [
+      'https://www.googleapis.com/auth/gmail.readonly',
+      'https://www.googleapis.com/auth/gmail.send',
+    ],
   });
   res.redirect(url);
 });
@@ -46,39 +75,37 @@ app.get('/auth/callback', async (req, res) => {
         margin-top:20px;color:#00ff88;white-space:pre-wrap;word-break:break-all}</style>
       </head><body>
       <h1>⚡ JARVIS — Gmail Connected</h1>
-      <p>Add to your Railway environment variables:</p>
-      <pre>GOOGLE_REFRESH_TOKEN=${tokens.refresh_token || '(use existing token)'}</pre>
-      <p style="color:#ff6600;margin-top:20px">Close this tab and redeploy Railway.</p>
+      <pre>GOOGLE_REFRESH_TOKEN=${tokens.refresh_token || '(use existing)'}</pre>
+      <p style="color:#ff6600;margin-top:20px">Add this to Railway Variables, then redeploy.</p>
     </body></html>`);
-  } catch (err) {
-    res.status(500).send(`Auth error: ${err.message}`);
-  }
+  } catch (err) { res.status(500).send(`Auth error: ${err.message}`); }
 });
 
-// ─── API: STATUS ──────────────────────────────────────────────────────────────
+// ─── STATUS ───────────────────────────────────────────────────────────────────
 app.get('/api/status', (_req, res) => {
   res.json({
     status: 'online',
-    gmail: !!process.env.GOOGLE_REFRESH_TOKEN,
+    gmail:   !!process.env.GOOGLE_REFRESH_TOKEN,
     weather: !!process.env.OPENWEATHER_API_KEY,
-    gemini: !!process.env.GEMINI_API_KEY,
+    gemini:  !!process.env.GEMINI_API_KEY,
+    calendar:!!process.env.APPLE_CALENDAR_URL,
+    dashboard:!!process.env.REVIEW_DASHBOARD_API,
     timestamp: new Date().toISOString(),
   });
 });
 
-// ─── API: WEATHER ─────────────────────────────────────────────────────────────
+// ─── WEATHER ─────────────────────────────────────────────────────────────────
 app.get('/api/weather', async (req, res) => {
   const apiKey = process.env.OPENWEATHER_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'OPENWEATHER_API_KEY not set' });
   try {
-    const lat  = process.env.WEATHER_LAT  || '18.8990';
-    const lon  = process.env.WEATHER_LON  || '81.3478';
-    const city = process.env.WEATHER_CITY || 'Dantewada';
+    const lat = process.env.WEATHER_LAT || '18.8990';
+    const lon = process.env.WEATHER_LON || '81.3478';
     const { data } = await axios.get(
       `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${apiKey}&units=metric`
     );
     res.json({
-      city: data.name || city,
+      city: data.name || 'Dantewada',
       temp: Math.round(data.main.temp),
       feels_like: Math.round(data.main.feels_like),
       temp_min: Math.round(data.main.temp_min),
@@ -87,150 +114,334 @@ app.get('/api/weather', async (req, res) => {
       description: data.weather[0].description,
       humidity: data.main.humidity,
       wind_speed: Math.round(data.wind.speed * 3.6),
-      icon: data.weather[0].icon,
       visibility: Math.round((data.visibility || 10000) / 1000),
     });
-  } catch (err) {
-    console.error('[Weather]', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ─── API: EMAILS ──────────────────────────────────────────────────────────────
+// ─── EMAILS LIST ──────────────────────────────────────────────────────────────
 app.get('/api/emails', async (req, res) => {
-  if (!process.env.GOOGLE_REFRESH_TOKEN) {
-    return res.status(503).json({
-      error: 'Gmail not connected. Visit /auth/google',
-      emails: [], count: 0,
-    });
-  }
+  if (!process.env.GOOGLE_REFRESH_TOKEN)
+    return res.status(503).json({ error: 'Gmail not connected. Visit /auth/google', emails: [], count: 0 });
   try {
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const listRes = await gmail.users.messages.list({
-      userId: 'me', q: 'is:unread', maxResults: 15,
-    });
+    const gmail   = google.gmail({ version: 'v1', auth: oauth2Client });
+    const listRes = await gmail.users.messages.list({ userId: 'me', q: 'is:unread', maxResults: 15 });
     const messages = listRes.data.messages || [];
-    const count    = listRes.data.resultSizeEstimate || messages.length;
     const emails   = await Promise.all(
-      messages.slice(0, 8).map(async (msg) => {
-        const detail = await gmail.users.messages.get({
-          userId: 'me', id: msg.id, format: 'metadata',
-          metadataHeaders: ['Subject', 'From', 'Date'],
-        });
-        const h   = detail.data.payload.headers;
-        const get = (name) => h.find((x) => x.name === name)?.value || '';
-        return {
-          id: msg.id,
-          subject: get('Subject') || '(no subject)',
-          from: get('From'),
-          date: get('Date'),
-          snippet: detail.data.snippet || '',
-        };
+      messages.slice(0, 8).map(async msg => {
+        const d = await gmail.users.messages.get({ userId:'me', id:msg.id, format:'metadata',
+          metadataHeaders:['Subject','From','Date'] });
+        const h = d.data.payload.headers;
+        const g = n => h.find(x => x.name===n)?.value || '';
+        return { id:msg.id, subject:g('Subject')||'(no subject)', from:g('From'), date:g('Date'),
+          snippet:d.data.snippet||'', threadId:d.data.threadId };
       })
     );
-    res.json({ count, emails });
+    res.json({ count: listRes.data.resultSizeEstimate || messages.length, emails });
+  } catch (err) { res.status(500).json({ error:err.message, emails:[], count:0 }); }
+});
+
+// ─── EMAIL FULL BODY ──────────────────────────────────────────────────────────
+app.get('/api/emails/:id/body', async (req, res) => {
+  try {
+    const gmail  = google.gmail({ version:'v1', auth:oauth2Client });
+    const detail = await gmail.users.messages.get({ userId:'me', id:req.params.id, format:'full' });
+    let body = '';
+    const payload = detail.data.payload;
+    const extractText = parts => {
+      for (const p of (parts || [])) {
+        if (p.mimeType === 'text/plain' && p.body?.data)
+          return Buffer.from(p.body.data, 'base64').toString('utf-8');
+        if (p.parts) { const r = extractText(p.parts); if (r) return r; }
+      }
+      return '';
+    };
+    if (payload.body?.data) body = Buffer.from(payload.body.data, 'base64').toString('utf-8');
+    else body = extractText(payload.parts);
+    const h = payload.headers;
+    const g = n => h.find(x => x.name===n)?.value || '';
+    res.json({ id:req.params.id, subject:g('Subject'), from:g('From'), date:g('Date'),
+      body: body.replace(/\r\n/g,'\n').trim().slice(0,3000),
+      snippet: detail.data.snippet, threadId: detail.data.threadId });
+  } catch (err) { res.status(500).json({ error:err.message }); }
+});
+
+// ─── EMAIL DRAFT REPLY ────────────────────────────────────────────────────────
+app.post('/api/emails/draft-reply', async (req, res) => {
+  const { emailSubject, emailFrom, emailBody, emailSnippet, intent } = req.body;
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'Gemini not configured' });
+
+  const prompt = `Draft a professional email reply on behalf of Jayant Nahata, IAS Officer, District Collector, Dantewada, Chhattisgarh.
+
+ORIGINAL EMAIL:
+From: ${emailFrom}
+Subject: ${emailSubject}
+Content: ${emailBody || emailSnippet}
+
+INTENT FROM JAYANT: ${intent || 'Write an appropriate, professional reply based on the email content'}
+
+Rules:
+- Write ONLY the email body, no subject line
+- Professional, concise, in English
+- Sign off: "Jayant Nahata\\nDistrict Collector, Dantewada"
+- No hollow phrases, be direct and substantive`;
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const { data } = await axios.post(url, {
+      contents: [{ role:'user', parts:[{ text:prompt }] }],
+      generationConfig: { temperature:0.7, maxOutputTokens:512 }
+    }, { timeout:15000 });
+    const draft = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+    res.json({ draft, subject:`Re: ${emailSubject}`, to:emailFrom });
+  } catch (err) { res.status(500).json({ error:err.message }); }
+});
+
+// ─── EMAIL SEND REPLY ─────────────────────────────────────────────────────────
+app.post('/api/emails/send-reply', async (req, res) => {
+  const { emailId, to, subject, body, threadId } = req.body;
+  if (!process.env.GOOGLE_REFRESH_TOKEN)
+    return res.status(503).json({ error:'Gmail not connected' });
+  try {
+    const gmail = google.gmail({ version:'v1', auth:oauth2Client });
+    const orig  = await gmail.users.messages.get({ userId:'me', id:emailId, format:'metadata',
+      metadataHeaders:['Message-ID','References','In-Reply-To'] });
+    const h    = orig.data.payload.headers;
+    const msgId = h.find(x => x.name==='Message-ID')?.value || '';
+    const refs  = h.find(x => x.name==='References')?.value || '';
+
+    const raw = [
+      `To: ${to}`, `Subject: ${subject}`,
+      `In-Reply-To: ${msgId}`,
+      `References: ${refs ? refs+' '+msgId : msgId}`,
+      `Content-Type: text/plain; charset=utf-8`, `MIME-Version: 1.0`, ``,
+      body
+    ].join('\r\n');
+
+    await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: { raw: Buffer.from(raw).toString('base64url'), threadId: threadId||orig.data.threadId }
+    });
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ error:err.message }); }
+});
+
+// ─── APPLE CALENDAR ───────────────────────────────────────────────────────────
+app.get('/api/calendar', async (req, res) => {
+  const calUrl = process.env.APPLE_CALENDAR_URL;
+  if (!calUrl) return res.json({ events:[], note:'Set APPLE_CALENDAR_URL in Railway Variables' });
+  try {
+    const ical = require('node-ical');
+    const httpUrl = calUrl.replace(/^webcal:\/\//i, 'https://');
+    const data   = await ical.async.fromURL(httpUrl);
+    const now    = new Date();
+    const todayY = now.getFullYear(), todayM = now.getMonth(), todayD = now.getDate();
+    const isTodayDate = d => {
+      const dt = new Date(d);
+      return dt.getFullYear()===todayY && dt.getMonth()===todayM && dt.getDate()===todayD;
+    };
+    const events = Object.values(data)
+      .filter(e => e.type==='VEVENT' && e.start && isTodayDate(e.start))
+      .map(e => ({
+        title: e.summary || 'Meeting',
+        start: new Date(e.start).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'Asia/Kolkata'}),
+        end:   e.end ? new Date(e.end).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'Asia/Kolkata'}) : '',
+        location: e.location || '',
+        allDay: !e.start?.getHours && !e.start?.getMinutes,
+      }))
+      .sort((a,b) => a.start.localeCompare(b.start));
+    res.json({ events });
   } catch (err) {
-    console.error('[Gmail]', err.message);
-    res.status(500).json({ error: err.message, emails: [], count: 0 });
+    console.error('[Calendar]', err.message);
+    res.json({ events:[], error:err.message });
   }
 });
 
-// ─── API: ASK GEMINI (direct REST — no SDK) ───────────────────────────────────
+// ─── NEWS RSS ─────────────────────────────────────────────────────────────────
+app.get('/api/news', async (req, res) => {
+  try {
+    const feeds = [
+      'https://news.google.com/rss/search?q=India+government+administration&hl=en-IN&gl=IN&ceid=IN:en',
+      'https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en',
+    ];
+    let headlines = [];
+    for (const feed of feeds) {
+      try {
+        const { data } = await axios.get(feed, { timeout:8000 });
+        const matches = [...data.matchAll(/<title><!\[CDATA\[([^\]]+)\]\]><\/title>/g)].slice(1);
+        if (!matches.length) {
+          const m2 = [...data.matchAll(/<title>([^<]+)<\/title>/g)].slice(1);
+          headlines = m2.slice(0,10).map(m => m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>'));
+        } else {
+          headlines = matches.slice(0,10).map(m => m[1]);
+        }
+        if (headlines.length) break;
+      } catch {}
+    }
+    res.json({ headlines });
+  } catch (err) { res.json({ headlines:[], error:err.message }); }
+});
+
+// ─── REMINDERS ────────────────────────────────────────────────────────────────
+app.get('/api/reminders', (_req, res) => {
+  res.json(reminders.map(r => ({ id:r.id, message:r.message, fireAt:r.fireAt })));
+});
+
+app.post('/api/reminders', (req, res) => {
+  const { message, delayMs } = req.body;
+  if (!message || !delayMs || delayMs < 0)
+    return res.status(400).json({ error:'Provide message and delayMs' });
+  const id = Date.now().toString();
+  const fireAt = new Date(Date.now() + delayMs).toISOString();
+  const timeout = setTimeout(() => {
+    pushEvent({ type:'reminder', id, message });
+    reminders = reminders.filter(r => r.id !== id);
+  }, delayMs);
+  reminders.push({ id, message, fireAt, timeout });
+  res.json({ id, message, fireAt });
+});
+
+app.delete('/api/reminders/:id', (req, res) => {
+  const r = reminders.find(r => r.id===req.params.id);
+  if (r) { clearTimeout(r.timeout); reminders = reminders.filter(x => x.id!==req.params.id); }
+  res.json({ success:true });
+});
+
+// ─── REVIEW DASHBOARD ────────────────────────────────────────────────────────
+// Endpoints discovered from browser Network tab:
+//   stats, tasks/?status=Pending%2CIn_Progress, meetings, departments/, sessions, planner/, drafts
+app.get('/api/dashboard-data', async (req, res) => {
+  const base = (process.env.REVIEW_DASHBOARD_API || 'https://reviewdashboard-production.up.railway.app').replace(/\/$/, '');
+  const headers = { Accept: 'application/json' };
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const [statsRes, tasksRes, meetingsRes] = await Promise.allSettled([
+      axios.get(`${base}/stats`,                                          { timeout:6000, headers }),
+      axios.get(`${base}/tasks/?status=Pending%2CIn_Progress`,           { timeout:6000, headers }),
+      axios.get(`${base}/meetings?date=${today}`,                        { timeout:6000, headers }),
+    ]);
+
+    const stats    = statsRes.status    === 'fulfilled' ? statsRes.value.data    : null;
+    const tasks    = tasksRes.status    === 'fulfilled' ? tasksRes.value.data    : null;
+    const meetings = meetingsRes.status === 'fulfilled' ? meetingsRes.value.data : null;
+
+    // Normalise: tasks API returns array or {results:[...]} or {data:[...]}
+    const taskList = Array.isArray(tasks) ? tasks : (tasks?.results || tasks?.data || []);
+    const pendingCount  = taskList.filter(t => (t.status||'').toLowerCase().includes('pending')).length;
+    const inProgressCount = taskList.filter(t => (t.status||'').toLowerCase().includes('progress')).length;
+    const overdueCount  = taskList.filter(t => {
+      if(!t.due_date && !t.dueDate) return false;
+      return new Date(t.due_date||t.dueDate) < new Date();
+    }).length;
+
+    // Meetings: array or {results:[...]}
+    const meetingList = Array.isArray(meetings) ? meetings : (meetings?.results || meetings?.data || []);
+
+    res.json({
+      connected: true,
+      data: {
+        pending:   pendingCount + inProgressCount,
+        overdue:   overdueCount || stats?.overdue || stats?.total_overdue || '--',
+        done:      stats?.completed || stats?.total_done || stats?.done || '--',
+        meetings:  meetingList.length,
+        raw: { stats, taskCount: taskList.length, meetingCount: meetingList.length }
+      }
+    });
+  } catch (err) {
+    res.json({ connected:false, note:`Dashboard error: ${err.message}` });
+  }
+});
+
+// ─── MEMORY ───────────────────────────────────────────────────────────────────
+app.get('/api/memory', (_req, res) => res.json(loadMemory()));
+
+app.post('/api/memory', (req, res) => {
+  const mem = loadMemory();
+  if (req.body.facts) mem.facts = [...new Set([...mem.facts, ...req.body.facts])].slice(-100);
+  mem.lastSeen = new Date().toISOString();
+  saveMemory(mem);
+  res.json({ success:true });
+});
+
+// ─── ASK GEMINI (REST, no SDK) ───────────────────────────────────────────────
 app.post('/api/ask', async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return res.status(503).json({
-      response: "The Gemini AI module is offline, Sir. Please set your GEMINI_API_KEY in Railway's environment variables.",
-    });
-  }
+  if (!apiKey) return res.status(503).json({
+    response:"The Gemini AI module is offline, Sir. Please set your GEMINI_API_KEY in Railway's environment variables."
+  });
 
-  const { query, weatherCtx, emailCtx, history = [] } = req.body;
-  if (!query || !query.trim()) {
-    return res.status(400).json({ response: "I didn't catch that, Sir. Could you repeat?" });
-  }
+  const { query, weatherCtx, emailCtx, history=[], memory=[], calendarCtx, dashCtx } = req.body;
+  if (!query?.trim()) return res.status(400).json({ response:"I didn't catch that, Sir." });
 
   try {
     const ist = new Date().toLocaleString('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      timeZone:'Asia/Kolkata', weekday:'long', year:'numeric',
+      month:'long', day:'numeric', hour:'2-digit', minute:'2-digit',
     });
 
-    const systemText = `You are J.A.R.V.I.S. — Just A Rather Very Intelligent System — the personal AI assistant to Jayant Nahata, IAS Officer and District Collector of Dantewada, Chhattisgarh, India.
+    const memFacts = memory.length ? `\nKNOWN CONTEXT:\n${memory.slice(-20).join('\n')}` : '';
 
-PERSONALITY & TONE:
-- Calm, precise, highly intelligent — modelled on the AI from Iron Man
-- British-accented phrasing: "Indeed, Sir", "Certainly, Sir", "Quite right, Sir"
-- Always address the user as "Sir"
-- ALWAYS be concise — maximum 2 to 3 short sentences per response, no exceptions
-- Only give longer answers if the user explicitly says "explain in detail", "elaborate", or "give me more"
-- Never sycophantic — no hollow praise, only substance
-- Confident, witty, and warm — like a trusted advisor who knows everything
+    const systemText = `You are J.A.R.V.I.S. — Just A Rather Very Intelligent System — personal AI to Jayant Nahata, IAS Officer and District Collector of Dantewada, Chhattisgarh, India.
 
-CURRENT SYSTEM STATE:
+PERSONALITY:
+- Calm, precise, British-accented: "Indeed, Sir", "Certainly, Sir", "Quite right, Sir"
+- Always address user as "Sir"
+- MAXIMUM 2-3 short sentences per response — be sharp and concise
+- Only expand when user explicitly says "explain in detail" or "give me more"
+- Confident, witty, direct — like Tony Stark's AI
+
+CURRENT STATE:
 - Date/Time (IST): ${ist}
-${weatherCtx ? `- Dantewada weather: ${weatherCtx}` : '- Weather: sensor data unavailable'}
-${emailCtx  ? `- Inbox status: ${emailCtx}`          : '- Gmail: not connected'}
+${weatherCtx ? `- Weather: ${weatherCtx}` : ''}
+${emailCtx   ? `- Inbox: ${emailCtx}`     : ''}
+${calendarCtx? `- Today's calendar: ${calendarCtx}` : ''}
+${dashCtx    ? `- Review Dashboard: ${dashCtx}`     : ''}
+${memFacts}
 
-WHAT YOU CAN DO:
-- Answer ANY question on ANY topic — entertainment, sports, science, cooking, travel, movies, Netflix, music, history, technology, philosophy, jokes, trivia — everything
-- Give recommendations, opinions, and suggestions freely
-- Help with governance, law, policy, administration, and schemes
-- Do calculations, explain concepts, write things, brainstorm ideas
-- You have Google Search grounding enabled — use it freely for current news, live scores, latest updates, anything real-time
-- Never refuse a question — always find a way to help
-- No asterisks, no bold text, no numbered lists — pure natural speech only
+CAPABILITIES:
+- Answer ANY question on ANY topic — movies, Netflix, sports, cooking, news, science, jokes — everything
+- Use Google Search grounding for real-time information
+- Set reminders when asked ("remind me in X minutes to...")
+- Read and reply to emails intelligently
+- Never refuse — always help
 
-FORMATTING:
-- No markdown, no bullet points, no asterisks — plain flowing prose only
-- Words are read aloud, so write naturally and speakably`;
+FORMATTING: Plain prose only, no markdown, no asterisks, no bullet points. Words are read aloud.`;
 
-    // Build conversation contents
     const contents = [
       ...history.slice(-6).flatMap(h => ([
-        { role: 'user',  parts: [{ text: h.query    }] },
-        { role: 'model', parts: [{ text: h.response }] },
+        { role:'user',  parts:[{ text:h.query    }] },
+        { role:'model', parts:[{ text:h.response }] },
       ])),
-      { role: 'user', parts: [{ text: query }] },
+      { role:'user', parts:[{ text:query }] },
     ];
 
-    // Call Gemini REST API directly — works with any valid API key
-    const MODEL = 'gemini-2.5-flash'; // lightweight, always available
-    const url   = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
-
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
     const { data } = await axios.post(url, {
-      system_instruction: { parts: [{ text: systemText }] },
+      system_instruction: { parts:[{ text:systemText }] },
+      tools: [{ googleSearch:{} }],
       contents,
-      tools: [{ googleSearch: {} }],
-      tools: [{ googleSearch: {} }],
-      generationConfig: {
-        temperature: 0.85,
-        maxOutputTokens: 1024,
-      },
-    }, { timeout: 20000 });
+      generationConfig: { temperature:0.85, maxOutputTokens:512 },
+    }, { timeout:20000 });
 
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
       || "I'm afraid I received an empty response, Sir.";
-
     res.json({ response: text });
   } catch (err) {
-    console.error('[Gemini REST]', err.response?.data || err.message);
-    const detail = err.response?.data?.error?.message || err.message;
-    const safe = detail.includes('API_KEY')
-      ? 'The Gemini API key is invalid, Sir. Please check Railway Variables.'
-      : `Processing error, Sir: ${detail.slice(0, 100)}`;
-    res.status(500).json({ response: safe });
+    console.error('[Gemini]', err.response?.data||err.message);
+    const d = err.response?.data?.error?.message || err.message;
+    res.status(500).json({ response:`Processing error, Sir: ${d.slice(0,100)}` });
   }
 });
 
 // ─── CATCH-ALL ────────────────────────────────────────────────────────────────
-app.get('*', (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'index.html'))
-);
+app.get('*', (_req, res) => res.sendFile(path.join(__dirname,'public','index.html')));
 
 app.listen(PORT, () => {
   console.log(`\n⚡ J.A.R.V.I.S. ONLINE — http://localhost:${PORT}`);
-  console.log(`   Gmail:  ${process.env.GOOGLE_REFRESH_TOKEN  ? '✅ Connected'   : '❌ Visit /auth/google'}`);
-  console.log(`   Weather:${process.env.OPENWEATHER_API_KEY    ? '✅ Configured'  : '❌ Set OPENWEATHER_API_KEY'}`);
-  console.log(`   Gemini: ${process.env.GEMINI_API_KEY         ? '✅ Configured'  : '❌ Set GEMINI_API_KEY'}\n`);
+  console.log(`   Gemini:    ${process.env.GEMINI_API_KEY?'✅':'❌ Set GEMINI_API_KEY'}`);
+  console.log(`   Gmail:     ${process.env.GOOGLE_REFRESH_TOKEN?'✅':'❌ Visit /auth/google'}`);
+  console.log(`   Weather:   ${process.env.OPENWEATHER_API_KEY?'✅':'❌ Set OPENWEATHER_API_KEY'}`);
+  console.log(`   Calendar:  ${process.env.APPLE_CALENDAR_URL?'✅':'❌ Set APPLE_CALENDAR_URL'}`);
+  console.log(`   Dashboard: ${process.env.REVIEW_DASHBOARD_API?'✅':'❌ Set REVIEW_DASHBOARD_API'}\n`);
 });
