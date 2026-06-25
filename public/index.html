@@ -977,7 +977,8 @@ function onDoubleClap() {
   if (currentMode === MODES.PROCESSING) return;
   flash('green');
   if (isSpeaking) { synth.cancel(); isSpeaking = false; }
-  speak(`Yes, ${USER_NAME}?`, () => startListening());
+  // Speak "Yes Sir?" then wait 800ms for audio pipeline to clear before listening
+  speak(`Yes, ${USER_NAME}?`, () => setTimeout(() => startListening(), 800));
 }
 
 // ─── INIT ───────────────────────────────────────────────────────────────────────
