@@ -193,7 +193,7 @@ FORMATTING:
     ];
 
     // Call Gemini REST API directly — works with any valid API key
-    const MODEL = 'gemini-2.0-flash-lite'; // lightweight, always available
+    const MODEL = 'gemini-2.5-flash'; // lightweight, always available
     const url   = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
 
     const { data } = await axios.post(url, {
