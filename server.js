@@ -135,7 +135,7 @@ app.get('/api/emails', async (req, res) => {
   }
 });
 
-// ─── API: ASK GEMINI ──────────────────────────────────────────────────────────
+// ─── API: ASK GEMINI (direct REST — no SDK) ───────────────────────────────────
 app.post('/api/ask', async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -150,16 +150,13 @@ app.post('/api/ask', async (req, res) => {
   }
 
   try {
-    const genAI = new GoogleGenerativeAI(apiKey);
-
-    // Build IST timestamp
     const ist = new Date().toLocaleString('en-IN', {
       timeZone: 'Asia/Kolkata',
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
       hour: '2-digit', minute: '2-digit', second: '2-digit',
     });
 
-    const systemInstruction = `You are J.A.R.V.I.S. — Just A Rather Very Intelligent System — the personal AI assistant to Jayant Nahata, IAS Officer and District Collector of Dantewada, Chhattisgarh, India.
+    const systemText = `You are J.A.R.V.I.S. — Just A Rather Very Intelligent System — the personal AI assistant to Jayant Nahata, IAS Officer and District Collector of Dantewada, Chhattisgarh, India.
 
 PERSONALITY & TONE:
 - Calm, precise, highly intelligent — modelled on the AI from Iron Man
@@ -179,35 +176,45 @@ WHAT YOU CAN DO:
 - Give recommendations, opinions, and suggestions freely
 - Help with governance, law, policy, administration, and schemes
 - Do calculations, explain concepts, write things, brainstorm ideas
-- For truly live real-time data (today's breaking news, live scores): mention you don't have live internet but still give your best knowledge-based answer
-- Never refuse a question or say something is "outside your scope" — always find a way to help
+- For live real-time data (breaking news, live scores): mention you lack live internet but still give your best knowledge-based answer
+- Never refuse a question — always find a way to help
 
-FORMATTING RULES:
+FORMATTING:
 - No markdown, no bullet points, no asterisks — plain flowing prose only
-- Your words are read aloud by voice synthesis, so write naturally and speakably
-- Short punchy sentences work best`;
+- Words are read aloud, so write naturally and speakably`;
 
-    // Build Gemini chat history from prior turns
-    const chatHistory = history.slice(-6).flatMap(h => ([
-      { role: 'user',  parts: [{ text: h.query    }] },
-      { role: 'model', parts: [{ text: h.response }] },
-    ]));
+    // Build conversation contents
+    const contents = [
+      ...history.slice(-6).flatMap(h => ([
+        { role: 'user',  parts: [{ text: h.query    }] },
+        { role: 'model', parts: [{ text: h.response }] },
+      ])),
+      { role: 'user', parts: [{ text: query }] },
+    ];
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',
-      systemInstruction,
-    });
+    // Call Gemini REST API directly — works with any valid API key
+    const MODEL = 'gemini-2.0-flash-lite'; // lightweight, always available
+    const url   = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
 
-    const chat   = model.startChat({ history: chatHistory });
-    const result = await chat.sendMessage(query);
-    const text   = result.response.text().trim();
+    const { data } = await axios.post(url, {
+      system_instruction: { parts: [{ text: systemText }] },
+      contents,
+      generationConfig: {
+        temperature: 0.85,
+        maxOutputTokens: 1024,
+      },
+    }, { timeout: 20000 });
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
+      || "I'm afraid I received an empty response, Sir.";
 
     res.json({ response: text });
   } catch (err) {
-    console.error('[Gemini]', err.message);
-    const safe = err.message.includes('API_KEY_INVALID')
-      ? 'The Gemini API key appears to be invalid, Sir. Please check your Railway environment variables.'
-      : `I encountered a processing error, Sir. ${err.message.slice(0, 120)}`;
+    console.error('[Gemini REST]', err.response?.data || err.message);
+    const detail = err.response?.data?.error?.message || err.message;
+    const safe = detail.includes('API_KEY')
+      ? 'The Gemini API key is invalid, Sir. Please check Railway Variables.'
+      : `Processing error, Sir: ${detail.slice(0, 100)}`;
     res.status(500).json({ response: safe });
   }
 });
