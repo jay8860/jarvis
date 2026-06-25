@@ -309,47 +309,68 @@ app.delete('/api/reminders/:id', (req, res) => {
 });
 
 // ─── REVIEW DASHBOARD ────────────────────────────────────────────────────────
-// Endpoints discovered from browser Network tab:
-//   stats, tasks/?status=Pending%2CIn_Progress, meetings, departments/, sessions, planner/, drafts
+const DASH_BASE = (process.env.REVIEW_DASHBOARD_API || 'https://reviewdashboard-production.up.railway.app').replace(/\/$/, '');
+const DASH_HEADERS = {
+  'Accept': 'application/json',
+  'Content-Type': 'application/json',
+  'X-Requested-With': 'XMLHttpRequest',
+};
+
+// Debug endpoint — visit /api/debug-dashboard to see raw API responses
+app.get('/api/debug-dashboard', async (req, res) => {
+  const today = new Date().toISOString().split('T')[0];
+  const endpoints = [
+    '/stats', '/tasks/', '/tasks/?status=Pending,In_Progress',
+    '/tasks/?status=Pending%2CIn_Progress', '/meetings', `/meetings?date=${today}`,
+    '/departments/', '/sessions', '/planner/', '/drafts',
+  ];
+  const results = {};
+  for (const ep of endpoints) {
+    try {
+      const r = await axios.get(DASH_BASE + ep, { timeout:5000, headers:DASH_HEADERS });
+      results[ep] = { status:r.status, type:typeof r.data, isArray:Array.isArray(r.data),
+        length:Array.isArray(r.data)?r.data.length:null,
+        keys:typeof r.data==='object'?Object.keys(r.data||{}).slice(0,10):null,
+        sample: JSON.stringify(r.data).slice(0,300) };
+    } catch(e) { results[ep] = { error: e.message, status: e.response?.status }; }
+  }
+  res.json(results);
+});
+
 app.get('/api/dashboard-data', async (req, res) => {
-  const base = (process.env.REVIEW_DASHBOARD_API || 'https://reviewdashboard-production.up.railway.app').replace(/\/$/, '');
-  const headers = { Accept: 'application/json' };
+  const today = new Date().toISOString().split('T')[0];
   try {
-    const today = new Date().toISOString().split('T')[0];
     const [statsRes, tasksRes, meetingsRes] = await Promise.allSettled([
-      axios.get(`${base}/stats`,                                          { timeout:6000, headers }),
-      axios.get(`${base}/tasks/?status=Pending%2CIn_Progress`,           { timeout:6000, headers }),
-      axios.get(`${base}/meetings?date=${today}`,                        { timeout:6000, headers }),
+      axios.get(`${DASH_BASE}/stats`,                              { timeout:7000, headers:DASH_HEADERS }),
+      axios.get(`${DASH_BASE}/tasks/?status=Pending,In_Progress`, { timeout:7000, headers:DASH_HEADERS }),
+      axios.get(`${DASH_BASE}/meetings`,                          { timeout:7000, headers:DASH_HEADERS }),
     ]);
 
     const stats    = statsRes.status    === 'fulfilled' ? statsRes.value.data    : null;
     const tasks    = tasksRes.status    === 'fulfilled' ? tasksRes.value.data    : null;
     const meetings = meetingsRes.status === 'fulfilled' ? meetingsRes.value.data : null;
 
-    // Normalise: tasks API returns array or {results:[...]} or {data:[...]} or {tasks:[...]}
-    const taskList = Array.isArray(tasks) ? tasks : (tasks?.results || tasks?.data || tasks?.tasks || []);
-    // URL already filters by Pending+In_Progress so ALL returned tasks are pending/active
-    const pendingCount = taskList.length;
-    const overdueCount = taskList.filter(t => {
-      const due = t.due_date || t.dueDate || t.deadline || t.due;
-      if(!due) return false;
-      return new Date(due) < new Date();
-    }).length || stats?.overdue || stats?.total_overdue || 0;
+    // Normalise various response shapes
+    const toList = d => Array.isArray(d)?d:(d?.results||d?.data||d?.tasks||d?.items||[]);
+    const taskList    = toList(tasks);
+    const meetingList = toList(meetings);
 
-    // Meetings: array or {results:[...]}
-    const meetingList = Array.isArray(meetings) ? meetings : (meetings?.results || meetings?.data || []);
+    // Derive stats — prefer explicit stats API, fall back to task list count
+    const pending = stats?.pending ?? stats?.pending_tasks ?? stats?.total_pending ?? taskList.length;
+    const overdue = stats?.overdue ?? stats?.overdue_tasks ?? stats?.total_overdue ??
+      taskList.filter(t=>{ const d=t.due_date||t.dueDate||t.deadline||t.due; return d&&new Date(d)<new Date(); }).length;
+    const done    = stats?.completed ?? stats?.done ?? stats?.total_completed ?? stats?.total_done ?? '--';
+    const mtgs    = stats?.meetings_today ?? meetingList.length;
 
     res.json({
       connected: true,
-      data: {
-        pending:   pendingCount,
-        overdue:   overdueCount || stats?.overdue || stats?.total_overdue || '--',
-        done:      stats?.completed || stats?.total_done || stats?.done || '--',
-        meetings:  meetingList.length,
-        raw: { stats, taskCount: taskList.length, meetingCount: meetingList.length }
+      data: { pending, overdue, done, meetings:mtgs,
+        raw: { statsKeys:Object.keys(stats||{}), taskCount:taskList.length, meetingCount:meetingList.length,
+          statsSample: JSON.stringify(stats).slice(0,200) }
       }
     });
   } catch (err) {
+    console.error('[Dashboard]', err.message);
     res.json({ connected:false, note:`Dashboard error: ${err.message}` });
   }
 });

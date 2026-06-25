@@ -216,6 +216,8 @@ canvas#hexBg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacit
         <div id="modeText">STANDBY</div>
         <div style="font-size:.6rem;color:var(--text)">SPACE / CLAP / TAP MIC</div>
       </div>
+      <!-- FREQUENCY VISUALIZER — shows when listening or speaking -->
+      <canvas id="vizCanvas" width="600" height="44" style="width:100%;height:44px;display:block;padding:4px 10px;box-sizing:border-box;opacity:.85"></canvas>
     </div>
 
     <div class="panel" style="flex:1;min-height:0">
@@ -379,67 +381,81 @@ function setMode(m){
   text.style.color=colors[m];text.textContent=m;
 }
 
+// ─── MIC LOCK (prevents speak→listen collision) ───
+let _micLocked = false, _micLockTimer = null;
+function lockMic(ms){
+  _micLocked=true; clearTimeout(_micLockTimer);
+  _micLockTimer=setTimeout(()=>{ _micLocked=false; },ms||700);
+}
+function unlockMic(){ _micLocked=false; clearTimeout(_micLockTimer); }
+
 // ─── SPEAK ────────────────────────────────────────
 function speak(text,cb){
   if(!text){if(cb)cb();return;}
   synth.cancel();isSpeaking=true;setMode(MODES.SPEAKING);
+  lockMic(400); // lock immediately so nothing triggers while speech queues
   const u=new SpeechSynthesisUtterance(text);
   u.lang='en-GB';u.rate=.92;u.pitch=.88;
   const v=synth.getVoices().find(v=>v.name.includes('Daniel')||v.name.includes('Google UK English Male'));
   if(v)u.voice=v;
-  u.onend=u.onerror=()=>{isSpeaking=false;setMode(MODES.STANDBY);if(cb)cb();};
+  u.onend=u.onerror=()=>{
+    isSpeaking=false;
+    lockMic(600); // lock for 600ms AFTER speech ends — gives audio stream time to clear
+    setMode(MODES.STANDBY);
+    if(cb)cb();
+  };
   synth.speak(u);
 }
 
 // ─── LISTEN ───────────────────────────────────────
-let _listenRetries = 0;
 function startListening(){
-  if(currentMode===MODES.PROCESSING)return;
+  if(currentMode===MODES.PROCESSING||_micLocked)return;
   if(isSpeaking){synth.cancel();isSpeaking=false;}
-  // Stop any existing recognition first
   if(recognition){try{recognition.abort();}catch(x){}}
   recognition=null;
   setMode(MODES.LISTENING);
   document.getElementById('dMic').style.width='80%';document.getElementById('dvMic').textContent='ON';
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){appendMsg('sys','Speech recognition not supported in this browser. Use Chrome.');setMode(MODES.STANDBY);return;}
-  recognition=new SR();
-  recognition.lang='en-IN';recognition.interimResults=false;recognition.maxAlternatives=1;
-  recognition.onresult=e=>{
-    _listenRetries=0;
+  if(!SR){appendMsg('sys','Use Chrome for voice — Safari does not support Web Speech API.');setMode(MODES.STANDBY);return;}
+  const rec=new SR();
+  recognition=rec;
+  rec.lang='en-IN';rec.interimResults=false;rec.maxAlternatives=1;
+  rec.onresult=e=>{
     const q=e.results[0][0].transcript;
     document.getElementById('dMic').style.width='30%';document.getElementById('dvMic').textContent='OK';
+    recognition=null;
     handleQuery(q);
   };
-  recognition.onerror=e=>{
+  rec.onerror=e=>{
     document.getElementById('dMic').style.width='20%';document.getElementById('dvMic').textContent='ERR';
-    if(e.error==='aborted'&&_listenRetries<2){
-      // Chrome fires "aborted" when AudioContext and SpeechRecognition compete — retry once
-      _listenRetries++;
-      setTimeout(()=>startListening(),600);
-      return;
-    }
-    _listenRetries=0;
+    recognition=null;
     setMode(MODES.STANDBY);
+    // Only show error if it's not a routine abort/no-speech
     if(e.error!=='no-speech'&&e.error!=='aborted')appendMsg('sys','Mic error: '+e.error);
   };
-  recognition.onend=()=>{_listenRetries=0;if(currentMode===MODES.LISTENING)setMode(MODES.STANDBY);};
-  // Small delay ensures AudioContext mic lock has settled
-  setTimeout(()=>{try{recognition&&recognition.start();}catch(x){setMode(MODES.STANDBY);}},150);
+  rec.onend=()=>{ recognition=null; if(currentMode===MODES.LISTENING)setMode(MODES.STANDBY); };
+  // 200ms delay ensures audio stream has settled after any prior TTS
+  setTimeout(()=>{ try{ if(rec===recognition) rec.start(); }catch(x){ setMode(MODES.STANDBY); } }, 200);
 }
 
 // ─── CLAP DETECTION ───────────────────────────────
+// ─── SHARED AUDIO: CLAP DETECTION + VISUALIZER ───
+let _vizAnalyser = null;
 (function(){
   let last=0;
   navigator.mediaDevices.getUserMedia({audio:true}).then(stream=>{
-    const ctx=new(window.AudioContext||window.webkitAudioContext)();
-    const src=ctx.createMediaStreamSource(stream);
-    const anal=ctx.createAnalyser();anal.fftSize=256;src.connect(anal);
-    const buf=new Uint8Array(anal.frequencyBinCount);
+    const aCtx=new(window.AudioContext||window.webkitAudioContext)();
+    const src=aCtx.createMediaStreamSource(stream);
+    // Clap analyser
+    const clapAnal=aCtx.createAnalyser();clapAnal.fftSize=256;src.connect(clapAnal);
+    const clapBuf=new Uint8Array(clapAnal.frequencyBinCount);
+    // Visualizer analyser (shared source, separate analyser)
+    _vizAnalyser=aCtx.createAnalyser();_vizAnalyser.fftSize=64;src.connect(_vizAnalyser);
+
     function tick(){
-      anal.getByteFrequencyData(buf);
-      const avg=buf.reduce((a,b)=>a+b,0)/buf.length;
-      if(avg>42&&currentMode!==MODES.PROCESSING){
+      clapAnal.getByteFrequencyData(clapBuf);
+      const avg=clapBuf.reduce((a,b)=>a+b,0)/clapBuf.length;
+      if(avg>42&&currentMode!==MODES.PROCESSING&&!_micLocked){
         const now=Date.now();
         if(now-last<700&&now-last>150)onDoubleClap();
         last=now;
@@ -447,14 +463,46 @@ function startListening(){
       requestAnimationFrame(tick);
     }
     tick();
+    drawViz(); // start visualizer loop
   }).catch(()=>{});
 })();
 
+// ─── FREQUENCY VISUALIZER ─────────────────────────
+function drawViz(){
+  const canvas=document.getElementById('vizCanvas');
+  if(!canvas)return;
+  const ctx=canvas.getContext('2d');
+  const W=canvas.width,H=canvas.height;
+  const vizBuf=new Uint8Array(32);
+  function frame(){
+    requestAnimationFrame(frame);
+    ctx.clearRect(0,0,W,H);
+    if(!_vizAnalyser||currentMode===MODES.STANDBY||currentMode===MODES.PROCESSING)return;
+    _vizAnalyser.getByteFrequencyData(vizBuf);
+    const active=currentMode===MODES.LISTENING;
+    const col=active?'#00ff88':'#00d4ff';
+    const glow=active?'rgba(0,255,136,':'rgba(0,212,255,';
+    const barW=W/vizBuf.length;
+    vizBuf.forEach((val,i)=>{
+      const h=Math.max(2,(val/255)*H*0.9);
+      const x=i*barW;
+      // gradient per bar
+      const g=ctx.createLinearGradient(0,H-h,0,H);
+      g.addColorStop(0,col);g.addColorStop(1,glow+'0.1)');
+      ctx.fillStyle=g;
+      ctx.shadowColor=col;ctx.shadowBlur=4;
+      ctx.fillRect(x+1,H-h,barW-2,h);
+    });
+    ctx.shadowBlur=0;
+  }
+  frame();
+}
+
 function onDoubleClap(){
-  if(currentMode===MODES.PROCESSING)return;
+  if(currentMode===MODES.PROCESSING||_micLocked)return;
   flashScreen('green');
-  if(isSpeaking){synth.cancel();isSpeaking=false;}
-  speak('Yes, '+USER_NAME+'?',()=>setTimeout(()=>startListening(),800));
+  if(isSpeaking){synth.cancel();isSpeaking=false;lockMic(900);}
+  speak('Yes, '+USER_NAME+'?',()=>setTimeout(()=>startListening(),900));
 }
 function flashScreen(c){
   const m={green:'rgba(0,255,136,0.12)',orange:'rgba(255,102,0,0.12)',cyan:'rgba(0,212,255,0.12)'};
@@ -462,8 +510,21 @@ function flashScreen(c){
 }
 
 document.addEventListener('keydown',e=>{
-  if(e.code==='Space'&&e.target===document.body){e.preventDefault();if(currentMode===MODES.STANDBY)startListening();}
-  if(e.code==='Escape'){synth.cancel();if(recognition)try{recognition.stop();}catch(x){}setMode(MODES.STANDBY);}
+  if(e.code==='Space'&&e.target===document.body){
+    e.preventDefault();
+    if(currentMode===MODES.SPEAKING){
+      // Interrupt JARVIS speech, then wait before listening
+      synth.cancel(); isSpeaking=false; lockMic(800);
+      setTimeout(()=>startListening(),800);
+    } else if(currentMode===MODES.STANDBY && !_micLocked){
+      startListening();
+    }
+  }
+  if(e.code==='Escape'){
+    synth.cancel();isSpeaking=false;
+    if(recognition)try{recognition.stop();}catch(x){}
+    recognition=null;lockMic(300);setMode(MODES.STANDBY);
+  }
 });
 
 // ─── CONV LOG ─────────────────────────────────────
