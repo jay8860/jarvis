@@ -224,7 +224,7 @@ canvas#hexBg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacit
         <div style="display:flex;gap:6px;align-items:center">
           <span id="memCount" style="font-size:.55rem;color:var(--purple)">MEM:0</span>
           <button onclick="clearLog()" style="font-size:.55rem;padding:1px 6px;border:1px solid var(--border);background:transparent;color:var(--text);font-family:inherit;cursor:pointer;border-radius:2px">CLEAR</button>
-          <button onclick="startListening()" style="font-size:.55rem;padding:1px 8px;border:1px solid var(--green);background:transparent;color:var(--green);font-family:inherit;cursor:pointer;border-radius:2px">🎤</button>
+          <button id="micBtn" onclick="startListening()" title="Click to speak (or press Space)" style="font-size:.72rem;padding:3px 10px;border:2px solid var(--green);background:rgba(0,255,136,.12);color:var(--green);font-family:inherit;cursor:pointer;border-radius:3px;font-weight:700;letter-spacing:1px;box-shadow:0 0 8px rgba(0,255,136,.3)">🎤 MIC</button>
         </div>
       </div>
       <div class="panelBody" id="convLog">
@@ -392,26 +392,40 @@ function speak(text,cb){
 }
 
 // ─── LISTEN ───────────────────────────────────────
+let _listenRetries = 0;
 function startListening(){
   if(currentMode===MODES.PROCESSING)return;
   if(isSpeaking){synth.cancel();isSpeaking=false;}
+  // Stop any existing recognition first
+  if(recognition){try{recognition.abort();}catch(x){}}
+  recognition=null;
   setMode(MODES.LISTENING);
   document.getElementById('dMic').style.width='80%';document.getElementById('dvMic').textContent='ON';
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){appendMsg('sys','Microphone not supported.');setMode(MODES.STANDBY);return;}
+  if(!SR){appendMsg('sys','Speech recognition not supported in this browser. Use Chrome.');setMode(MODES.STANDBY);return;}
   recognition=new SR();
   recognition.lang='en-IN';recognition.interimResults=false;recognition.maxAlternatives=1;
   recognition.onresult=e=>{
+    _listenRetries=0;
     const q=e.results[0][0].transcript;
     document.getElementById('dMic').style.width='30%';document.getElementById('dvMic').textContent='OK';
     handleQuery(q);
   };
   recognition.onerror=e=>{
-    setMode(MODES.STANDBY);document.getElementById('dMic').style.width='20%';document.getElementById('dvMic').textContent='ERR';
-    if(e.error!=='no-speech')appendMsg('sys','Mic error: '+e.error);
+    document.getElementById('dMic').style.width='20%';document.getElementById('dvMic').textContent='ERR';
+    if(e.error==='aborted'&&_listenRetries<2){
+      // Chrome fires "aborted" when AudioContext and SpeechRecognition compete — retry once
+      _listenRetries++;
+      setTimeout(()=>startListening(),600);
+      return;
+    }
+    _listenRetries=0;
+    setMode(MODES.STANDBY);
+    if(e.error!=='no-speech'&&e.error!=='aborted')appendMsg('sys','Mic error: '+e.error);
   };
-  recognition.onend=()=>{if(currentMode===MODES.LISTENING)setMode(MODES.STANDBY);};
-  recognition.start();
+  recognition.onend=()=>{_listenRetries=0;if(currentMode===MODES.LISTENING)setMode(MODES.STANDBY);};
+  // Small delay ensures AudioContext mic lock has settled
+  setTimeout(()=>{try{recognition&&recognition.start();}catch(x){setMode(MODES.STANDBY);}},150);
 }
 
 // ─── CLAP DETECTION ───────────────────────────────
@@ -425,7 +439,7 @@ function startListening(){
     function tick(){
       anal.getByteFrequencyData(buf);
       const avg=buf.reduce((a,b)=>a+b,0)/buf.length;
-      if(avg>55&&currentMode!==MODES.PROCESSING){
+      if(avg>42&&currentMode!==MODES.PROCESSING){
         const now=Date.now();
         if(now-last<700&&now-last>150)onDoubleClap();
         last=now;
@@ -699,12 +713,20 @@ async function loadDashboard(){
     const r=await fetch('/api/dashboard-data'),d=await r.json();dashCache=d;
     if(d.connected&&d.data){
       const data=d.data;
-      document.getElementById('dPending').textContent=data.pending??data.pendingTasks??data.total_pending??'--';
-      document.getElementById('dOverdue').textContent=data.overdue??data.overdueTasks??data.total_overdue??'--';
-      document.getElementById('dDone').textContent=data.done??data.completed??data.total_done??'--';
-      document.getElementById('dMeetings').textContent=data.meetings??data.todayMeetings??data.meetings_today??'--';
+      // data.pending = taskList.length from server (all returned tasks are pending/in-progress)
+      // data.raw.taskCount is the raw count; fall through multiple field names
+      const pending = data.pending??data.pendingTasks??data.raw?.taskCount??'--';
+      const overdue = data.overdue??data.overdueTasks??data.raw?.stats?.overdue??'--';
+      const done    = data.done??data.completed??data.raw?.stats?.completed??data.raw?.stats?.done??'--';
+      const meetings= data.meetings??data.todayMeetings??data.meetings_today??'--';
+      document.getElementById('dPending').textContent=pending;
+      document.getElementById('dOverdue').textContent=overdue;
+      document.getElementById('dDone').textContent=done;
+      document.getElementById('dMeetings').textContent=meetings;
+      // Update dashCtx for JARVIS voice context
+      dashCache.summary=`${pending} pending tasks, ${overdue} overdue, ${meetings} meetings today`;
     }else if(d.note){document.getElementById('dashNote').textContent=d.note;}
-  }catch{}
+  }catch(err){document.getElementById('dashNote')&&(document.getElementById('dashNote').textContent='Dashboard error: '+err.message);}
 }
 
 // ─── INIT ─────────────────────────────────────────

@@ -326,14 +326,15 @@ app.get('/api/dashboard-data', async (req, res) => {
     const tasks    = tasksRes.status    === 'fulfilled' ? tasksRes.value.data    : null;
     const meetings = meetingsRes.status === 'fulfilled' ? meetingsRes.value.data : null;
 
-    // Normalise: tasks API returns array or {results:[...]} or {data:[...]}
-    const taskList = Array.isArray(tasks) ? tasks : (tasks?.results || tasks?.data || []);
-    const pendingCount  = taskList.filter(t => (t.status||'').toLowerCase().includes('pending')).length;
-    const inProgressCount = taskList.filter(t => (t.status||'').toLowerCase().includes('progress')).length;
-    const overdueCount  = taskList.filter(t => {
-      if(!t.due_date && !t.dueDate) return false;
-      return new Date(t.due_date||t.dueDate) < new Date();
-    }).length;
+    // Normalise: tasks API returns array or {results:[...]} or {data:[...]} or {tasks:[...]}
+    const taskList = Array.isArray(tasks) ? tasks : (tasks?.results || tasks?.data || tasks?.tasks || []);
+    // URL already filters by Pending+In_Progress so ALL returned tasks are pending/active
+    const pendingCount = taskList.length;
+    const overdueCount = taskList.filter(t => {
+      const due = t.due_date || t.dueDate || t.deadline || t.due;
+      if(!due) return false;
+      return new Date(due) < new Date();
+    }).length || stats?.overdue || stats?.total_overdue || 0;
 
     // Meetings: array or {results:[...]}
     const meetingList = Array.isArray(meetings) ? meetings : (meetings?.results || meetings?.data || []);
@@ -341,7 +342,7 @@ app.get('/api/dashboard-data', async (req, res) => {
     res.json({
       connected: true,
       data: {
-        pending:   pendingCount + inProgressCount,
+        pending:   pendingCount,
         overdue:   overdueCount || stats?.overdue || stats?.total_overdue || '--',
         done:      stats?.completed || stats?.total_done || stats?.done || '--',
         meetings:  meetingList.length,
