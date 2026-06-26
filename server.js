@@ -349,9 +349,9 @@ app.get('/api/dashboard-data', async (req, res) => {
   const isValidJSON = d => typeof d !== 'string' || !d.trim().startsWith('<!');
   try {
     const [statsRes, tasksRes, meetingsRes] = await Promise.allSettled([
-      axios.get(`${DASH_BASE}/api/stats`,                              { timeout:7000, headers:DASH_HEADERS }),
-      axios.get(`${DASH_BASE}/api/tasks/?status=Pending,In_Progress`, { timeout:7000, headers:DASH_HEADERS }),
-      axios.get(`${DASH_BASE}/api/meetings`,                          { timeout:7000, headers:DASH_HEADERS }),
+      axios.get(`${DASH_BASE}/api/stats`,                                          { timeout:7000, headers:DASH_HEADERS }),
+      axios.get(`${DASH_BASE}/api/tasks/?status=Pending%2CIn_Progress&limit=200`, { timeout:7000, headers:DASH_HEADERS }),
+      axios.get(`${DASH_BASE}/api/meetings`,                                       { timeout:7000, headers:DASH_HEADERS }),
     ]);
 
     const getRaw = (r) => {
@@ -370,20 +370,26 @@ app.get('/api/dashboard-data', async (req, res) => {
     const taskList    = toList(tasks);
     const meetingList = toList(meetings);
 
-    // Derive stats — prefer explicit stats API, fall back to task list count
-    const pending = stats?.pending ?? stats?.pending_tasks ?? stats?.total_pending ?? taskList.length;
-    const overdue = stats?.overdue ?? stats?.overdue_tasks ?? stats?.total_overdue ??
-      taskList.filter(t=>{ const d=t.due_date||t.dueDate||t.deadline||t.due; return d&&new Date(d)<new Date(); }).length;
-    const done    = stats?.completed ?? stats?.done ?? stats?.total_completed ?? stats?.total_done ?? '--';
-    const mtgs    = stats?.meetings_today ?? meetingList.length;
+    // Normalise — try every common field name the Review Dashboard might use
+    // Visit /api/debug-dashboard to see what statsKeys actually are
+    const pending = stats?.pending ?? stats?.pending_tasks ?? stats?.total_pending
+      ?? stats?.Pending ?? stats?.count_pending ?? taskList.length;
+    const overdue = stats?.overdue ?? stats?.overdue_tasks ?? stats?.total_overdue
+      ?? stats?.Overdue ?? stats?.count_overdue
+      ?? taskList.filter(t=>{ const d=t.due_date||t.dueDate||t.deadline||t.due; return d&&new Date(d)<new Date(); }).length;
+    const done    = stats?.completed ?? stats?.done ?? stats?.total_completed ?? stats?.total_done
+      ?? stats?.Completed ?? stats?.count_completed ?? '--';
+    const important = stats?.important ?? stats?.total_important ?? '--';
+    const total   = stats?.total ?? stats?.total_tasks ?? stats?.count ?? '--';
+    const mtgs    = stats?.meetings_today ?? stats?.today_meetings ?? meetingList.length;
 
     const anyData = stats !== null || tasks !== null || meetings !== null;
     res.json({
       connected: anyData,
       note: anyData ? null : 'Review Dashboard API is returning HTML for all /api/* paths — check /api/debug-dashboard for details',
-      data: anyData ? { pending, overdue, done, meetings:mtgs,
+      data: anyData ? { pending, overdue, done, important, total, meetings:mtgs,
         raw: { statsKeys:Object.keys(stats||{}), taskCount:taskList.length, meetingCount:meetingList.length,
-          statsSample: JSON.stringify(stats).slice(0,200) }
+          statsSample: JSON.stringify(stats).slice(0,300) }
       } : null
     });
   } catch (err) {

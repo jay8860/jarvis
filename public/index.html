@@ -382,38 +382,39 @@ function setMode(m){
 }
 
 // ═══════════════════════════════════════════════════
-// MIC ENGINE — single instance, proper state machine
+// MIC ENGINE — rock-solid, no glitches
 // ═══════════════════════════════════════════════════
-let _busy = false;           // true while TTS playing or in cooldown
-let _busyTimer = null;
-let _activeRec = null;       // single SpeechRecognition instance ever active
-let _interimEl = null;       // live transcript element in conv log
+let _busy = false, _busyTimer = null;
+let _activeRec = null;        // the ONE active SpeechRecognition instance
+let _interimEl = null;        // live transcript bubble
+let _silenceTimer = null;     // auto-stop after prolonged silence
+let _collectedFinals = '';    // accumulates final speech across continuous mode pauses
 
 function setBusy(ms) {
-  _busy = true;
-  clearTimeout(_busyTimer);
+  _busy = true; clearTimeout(_busyTimer);
   _busyTimer = setTimeout(() => { _busy = false; }, ms);
+}
+
+function _cleanupRec() {
+  clearTimeout(_silenceTimer);
+  if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+  _collectedFinals = '';
 }
 
 // ─── SPEAK ────────────────────────────────────────
 function speak(text, cb) {
   if (!text) { if (cb) cb(); return; }
-  // Kill any active recognition before speaking
+  // Kill mic before speaking
   if (_activeRec) { try { _activeRec.abort(); } catch(x) {} _activeRec = null; }
-  if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+  _cleanupRec();
   synth.cancel();
-  isSpeaking = true;
-  setMode(MODES.SPEAKING);
-  setBusy(300);  // lock immediately
+  isSpeaking = true; setMode(MODES.SPEAKING); setBusy(300);
   const u = new SpeechSynthesisUtterance(text);
   u.lang = 'en-GB'; u.rate = 0.92; u.pitch = 0.88;
   const v = synth.getVoices().find(v => v.name.includes('Daniel') || v.name.includes('Google UK English Male'));
   if (v) u.voice = v;
   u.onend = u.onerror = () => {
-    isSpeaking = false;
-    setBusy(750);  // 750ms cooldown after speech — audio stream needs to drain
-    setMode(MODES.STANDBY);
-    if (cb) cb();
+    isSpeaking = false; setBusy(800); setMode(MODES.STANDBY); if (cb) cb();
   };
   synth.speak(u);
 }
@@ -423,9 +424,9 @@ function startListening() {
   if (_busy || currentMode === MODES.PROCESSING) return;
   if (isSpeaking) { synth.cancel(); isSpeaking = false; setBusy(900); return; }
 
-  // Kill stale instance
+  // Kill stale instance first
   if (_activeRec) { try { _activeRec.abort(); } catch(x) {} _activeRec = null; }
-  if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+  _cleanupRec();
 
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { appendMsg('sys', 'Use Chrome — Safari does not support Web Speech.'); return; }
@@ -437,44 +438,50 @@ function startListening() {
   const rec = new SR();
   _activeRec = rec;
   rec.lang = 'en-IN';
-  rec.interimResults = true;   // live transcript
+  rec.interimResults = true;
   rec.maxAlternatives = 1;
-  rec.continuous = false;
+  rec.continuous = true;  // CRITICAL: prevents Chrome auto-terminating after silence
 
-  // Create live transcript element
+  // Live transcript bubble
   _interimEl = (function() {
     const log = document.getElementById('convLog');
     const d = document.createElement('div');
-    d.className = 'msg';
-    d.id = 'interimMsg';
+    d.className = 'msg'; d.id = 'interimMsg';
     d.innerHTML = '<div class="badge you">YOU</div>'
       + '<div class="msg-text" id="interimText" style="color:var(--green);font-style:italic;opacity:.75">🎤 Listening...</div>';
-    log.appendChild(d);
-    log.scrollTop = log.scrollHeight;
+    log.appendChild(d); log.scrollTop = log.scrollHeight;
     return d;
   })();
 
+  // Auto-stop after 12s of silence (safety valve)
+  function resetSilenceTimer() {
+    clearTimeout(_silenceTimer);
+    _silenceTimer = setTimeout(() => {
+      if (_activeRec === rec) { try { rec.stop(); } catch(x) {} }
+    }, 12000);
+  }
+  resetSilenceTimer();
+
   rec.onresult = e => {
+    resetSilenceTimer();  // reset timer every time speech is detected
     const parts = Array.from(e.results);
     const interim = parts.filter(r => !r.isFinal).map(r => r[0].transcript).join('');
-    const finals  = parts.filter(r =>  r.isFinal).map(r => r[0].transcript).join('');
-    const shown   = finals + interim;
-    const el = document.getElementById('interimText');
-    if (el) el.textContent = shown || '🎤 Listening...';
+    const newFinals = parts.filter(r => r.isFinal).map(r => r[0].transcript).join(' ').trim();
 
-    if (parts[parts.length - 1].isFinal) {
-      const q = finals.trim();
-      if (_interimEl) { _interimEl.remove(); _interimEl = null; }
-      if (_activeRec === rec) _activeRec = null;
-      document.getElementById('dMic').style.width = '30%';
-      document.getElementById('dvMic').textContent = 'OK';
-      if (q) handleQuery(q);
-      else setMode(MODES.STANDBY);
+    if (newFinals) _collectedFinals = (_collectedFinals + ' ' + newFinals).trim();
+
+    // Update live display
+    const el = document.getElementById('interimText');
+    if (el) el.textContent = (_collectedFinals + (interim ? ' ' + interim : '')) || '🎤 Listening...';
+
+    // Got a final phrase → stop and submit
+    if (newFinals) {
+      if (_activeRec === rec) { _activeRec = null; try { rec.stop(); } catch(x) {} }
     }
   };
 
   rec.onerror = e => {
-    if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+    _cleanupRec();
     if (_activeRec === rec) _activeRec = null;
     document.getElementById('dMic').style.width = '20%';
     document.getElementById('dvMic').textContent = 'ERR';
@@ -483,20 +490,28 @@ function startListening() {
   };
 
   rec.onend = () => {
-    if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+    const q = _collectedFinals.trim();
+    _cleanupRec();
     if (_activeRec === rec) _activeRec = null;
-    if (currentMode === MODES.LISTENING) setMode(MODES.STANDBY);
+    document.getElementById('dMic').style.width = '30%';
+    document.getElementById('dvMic').textContent = q ? 'OK' : 'STB';
+    if (q) handleQuery(q);
+    else if (currentMode === MODES.LISTENING) setMode(MODES.STANDBY);
   };
 
-  // 250ms settle time before starting — prevents audio-stream conflict with TTS
+  // 250ms settle — prevents audio-stream clash with TTS tail
   setTimeout(() => {
     if (_activeRec === rec && !_busy) {
       try { rec.start(); }
-      catch(x) { _activeRec = null; setMode(MODES.STANDBY); }
+      catch(x) { _activeRec = null; _cleanupRec(); setMode(MODES.STANDBY); }
     } else {
-      _activeRec = null; setMode(MODES.STANDBY);
+      _activeRec = null; _cleanupRec(); setMode(MODES.STANDBY);
     }
   }, 250);
+}
+
+function stopListening() {
+  if (_activeRec) { try { _activeRec.stop(); } catch(x) {} }
 }
 
 // ─── CLAP DETECTION ───────────────────────────────
@@ -570,25 +585,24 @@ function flashScreen(c){
   document.body.style.background=m[c]||m.cyan;setTimeout(()=>document.body.style.background='',300);
 }
 
-document.addEventListener('keydown',e=>{
-  if(e.code==='Space'&&e.target===document.body){
+document.addEventListener('keydown', e => {
+  // CRITICAL: e.repeat=true when key is held — ignore repeats entirely
+  if (e.code === 'Space' && e.target === document.body && !e.repeat) {
     e.preventDefault();
-    if(currentMode===MODES.SPEAKING){
-      // Interrupt JARVIS — stop speech, cooldown, then listen
-      synth.cancel(); isSpeaking=false; setBusy(900);
-      setTimeout(()=>startListening(),900);
-    } else if(currentMode===MODES.STANDBY){
+    if (currentMode === MODES.SPEAKING) {
+      synth.cancel(); isSpeaking = false; setBusy(800);
+      setTimeout(() => startListening(), 800);
+    } else if (currentMode === MODES.LISTENING) {
+      // Second tap while listening = stop early and submit whatever was heard
+      stopListening();
+    } else if (currentMode === MODES.STANDBY && !_busy) {
       startListening();
-    } else if(currentMode===MODES.LISTENING){
-      // Stop listening early, submit what we have
-      if(_activeRec){try{_activeRec.stop();}catch(x){}}
     }
   }
-  if(e.code==='Escape'){
-    synth.cancel(); isSpeaking=false;
-    if(_activeRec){try{_activeRec.abort();}catch(x){} _activeRec=null;}
-    if(_interimEl){_interimEl.remove();_interimEl=null;}
-    setBusy(300); setMode(MODES.STANDBY);
+  if (e.code === 'Escape') {
+    synth.cancel(); isSpeaking = false;
+    if (_activeRec) { try { _activeRec.abort(); } catch(x) {} _activeRec = null; }
+    _cleanupRec(); setBusy(300); setMode(MODES.STANDBY);
   }
 });
 
