@@ -381,61 +381,122 @@ function setMode(m){
   text.style.color=colors[m];text.textContent=m;
 }
 
-// ─── MIC LOCK (prevents speak→listen collision) ───
-let _micLocked = false, _micLockTimer = null;
-function lockMic(ms){
-  _micLocked=true; clearTimeout(_micLockTimer);
-  _micLockTimer=setTimeout(()=>{ _micLocked=false; },ms||700);
+// ═══════════════════════════════════════════════════
+// MIC ENGINE — single instance, proper state machine
+// ═══════════════════════════════════════════════════
+let _busy = false;           // true while TTS playing or in cooldown
+let _busyTimer = null;
+let _activeRec = null;       // single SpeechRecognition instance ever active
+let _interimEl = null;       // live transcript element in conv log
+
+function setBusy(ms) {
+  _busy = true;
+  clearTimeout(_busyTimer);
+  _busyTimer = setTimeout(() => { _busy = false; }, ms);
 }
-function unlockMic(){ _micLocked=false; clearTimeout(_micLockTimer); }
 
 // ─── SPEAK ────────────────────────────────────────
-function speak(text,cb){
-  if(!text){if(cb)cb();return;}
-  synth.cancel();isSpeaking=true;setMode(MODES.SPEAKING);
-  lockMic(400); // lock immediately so nothing triggers while speech queues
-  const u=new SpeechSynthesisUtterance(text);
-  u.lang='en-GB';u.rate=.92;u.pitch=.88;
-  const v=synth.getVoices().find(v=>v.name.includes('Daniel')||v.name.includes('Google UK English Male'));
-  if(v)u.voice=v;
-  u.onend=u.onerror=()=>{
-    isSpeaking=false;
-    lockMic(600); // lock for 600ms AFTER speech ends — gives audio stream time to clear
+function speak(text, cb) {
+  if (!text) { if (cb) cb(); return; }
+  // Kill any active recognition before speaking
+  if (_activeRec) { try { _activeRec.abort(); } catch(x) {} _activeRec = null; }
+  if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+  synth.cancel();
+  isSpeaking = true;
+  setMode(MODES.SPEAKING);
+  setBusy(300);  // lock immediately
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'en-GB'; u.rate = 0.92; u.pitch = 0.88;
+  const v = synth.getVoices().find(v => v.name.includes('Daniel') || v.name.includes('Google UK English Male'));
+  if (v) u.voice = v;
+  u.onend = u.onerror = () => {
+    isSpeaking = false;
+    setBusy(750);  // 750ms cooldown after speech — audio stream needs to drain
     setMode(MODES.STANDBY);
-    if(cb)cb();
+    if (cb) cb();
   };
   synth.speak(u);
 }
 
 // ─── LISTEN ───────────────────────────────────────
-function startListening(){
-  if(currentMode===MODES.PROCESSING||_micLocked)return;
-  if(isSpeaking){synth.cancel();isSpeaking=false;}
-  if(recognition){try{recognition.abort();}catch(x){}}
-  recognition=null;
+function startListening() {
+  if (_busy || currentMode === MODES.PROCESSING) return;
+  if (isSpeaking) { synth.cancel(); isSpeaking = false; setBusy(900); return; }
+
+  // Kill stale instance
+  if (_activeRec) { try { _activeRec.abort(); } catch(x) {} _activeRec = null; }
+  if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { appendMsg('sys', 'Use Chrome — Safari does not support Web Speech.'); return; }
+
   setMode(MODES.LISTENING);
-  document.getElementById('dMic').style.width='80%';document.getElementById('dvMic').textContent='ON';
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){appendMsg('sys','Use Chrome for voice — Safari does not support Web Speech API.');setMode(MODES.STANDBY);return;}
-  const rec=new SR();
-  recognition=rec;
-  rec.lang='en-IN';rec.interimResults=false;rec.maxAlternatives=1;
-  rec.onresult=e=>{
-    const q=e.results[0][0].transcript;
-    document.getElementById('dMic').style.width='30%';document.getElementById('dvMic').textContent='OK';
-    recognition=null;
-    handleQuery(q);
+  document.getElementById('dMic').style.width = '80%';
+  document.getElementById('dvMic').textContent = 'ON';
+
+  const rec = new SR();
+  _activeRec = rec;
+  rec.lang = 'en-IN';
+  rec.interimResults = true;   // live transcript
+  rec.maxAlternatives = 1;
+  rec.continuous = false;
+
+  // Create live transcript element
+  _interimEl = (function() {
+    const log = document.getElementById('convLog');
+    const d = document.createElement('div');
+    d.className = 'msg';
+    d.id = 'interimMsg';
+    d.innerHTML = '<div class="badge you">YOU</div>'
+      + '<div class="msg-text" id="interimText" style="color:var(--green);font-style:italic;opacity:.75">🎤 Listening...</div>';
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+    return d;
+  })();
+
+  rec.onresult = e => {
+    const parts = Array.from(e.results);
+    const interim = parts.filter(r => !r.isFinal).map(r => r[0].transcript).join('');
+    const finals  = parts.filter(r =>  r.isFinal).map(r => r[0].transcript).join('');
+    const shown   = finals + interim;
+    const el = document.getElementById('interimText');
+    if (el) el.textContent = shown || '🎤 Listening...';
+
+    if (parts[parts.length - 1].isFinal) {
+      const q = finals.trim();
+      if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+      if (_activeRec === rec) _activeRec = null;
+      document.getElementById('dMic').style.width = '30%';
+      document.getElementById('dvMic').textContent = 'OK';
+      if (q) handleQuery(q);
+      else setMode(MODES.STANDBY);
+    }
   };
-  rec.onerror=e=>{
-    document.getElementById('dMic').style.width='20%';document.getElementById('dvMic').textContent='ERR';
-    recognition=null;
+
+  rec.onerror = e => {
+    if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+    if (_activeRec === rec) _activeRec = null;
+    document.getElementById('dMic').style.width = '20%';
+    document.getElementById('dvMic').textContent = 'ERR';
     setMode(MODES.STANDBY);
-    // Only show error if it's not a routine abort/no-speech
-    if(e.error!=='no-speech'&&e.error!=='aborted')appendMsg('sys','Mic error: '+e.error);
+    if (e.error !== 'no-speech' && e.error !== 'aborted') appendMsg('sys', 'Mic: ' + e.error);
   };
-  rec.onend=()=>{ recognition=null; if(currentMode===MODES.LISTENING)setMode(MODES.STANDBY); };
-  // 200ms delay ensures audio stream has settled after any prior TTS
-  setTimeout(()=>{ try{ if(rec===recognition) rec.start(); }catch(x){ setMode(MODES.STANDBY); } }, 200);
+
+  rec.onend = () => {
+    if (_interimEl) { _interimEl.remove(); _interimEl = null; }
+    if (_activeRec === rec) _activeRec = null;
+    if (currentMode === MODES.LISTENING) setMode(MODES.STANDBY);
+  };
+
+  // 250ms settle time before starting — prevents audio-stream conflict with TTS
+  setTimeout(() => {
+    if (_activeRec === rec && !_busy) {
+      try { rec.start(); }
+      catch(x) { _activeRec = null; setMode(MODES.STANDBY); }
+    } else {
+      _activeRec = null; setMode(MODES.STANDBY);
+    }
+  }, 250);
 }
 
 // ─── CLAP DETECTION ───────────────────────────────
@@ -455,7 +516,7 @@ let _vizAnalyser = null;
     function tick(){
       clapAnal.getByteFrequencyData(clapBuf);
       const avg=clapBuf.reduce((a,b)=>a+b,0)/clapBuf.length;
-      if(avg>42&&currentMode!==MODES.PROCESSING&&!_micLocked){
+      if(avg>52&&currentMode!==MODES.PROCESSING&&!_busy){
         const now=Date.now();
         if(now-last<700&&now-last>150)onDoubleClap();
         last=now;
@@ -499,10 +560,10 @@ function drawViz(){
 }
 
 function onDoubleClap(){
-  if(currentMode===MODES.PROCESSING||_micLocked)return;
+  if(currentMode===MODES.PROCESSING||_busy)return;
   flashScreen('green');
-  if(isSpeaking){synth.cancel();isSpeaking=false;lockMic(900);}
-  speak('Yes, '+USER_NAME+'?',()=>setTimeout(()=>startListening(),900));
+  if(isSpeaking){synth.cancel();isSpeaking=false;setBusy(900);}
+  speak('Yes, '+USER_NAME+'?',()=>setTimeout(()=>startListening(),400));
 }
 function flashScreen(c){
   const m={green:'rgba(0,255,136,0.12)',orange:'rgba(255,102,0,0.12)',cyan:'rgba(0,212,255,0.12)'};
@@ -513,17 +574,21 @@ document.addEventListener('keydown',e=>{
   if(e.code==='Space'&&e.target===document.body){
     e.preventDefault();
     if(currentMode===MODES.SPEAKING){
-      // Interrupt JARVIS speech, then wait before listening
-      synth.cancel(); isSpeaking=false; lockMic(800);
-      setTimeout(()=>startListening(),800);
-    } else if(currentMode===MODES.STANDBY && !_micLocked){
+      // Interrupt JARVIS — stop speech, cooldown, then listen
+      synth.cancel(); isSpeaking=false; setBusy(900);
+      setTimeout(()=>startListening(),900);
+    } else if(currentMode===MODES.STANDBY){
       startListening();
+    } else if(currentMode===MODES.LISTENING){
+      // Stop listening early, submit what we have
+      if(_activeRec){try{_activeRec.stop();}catch(x){}}
     }
   }
   if(e.code==='Escape'){
-    synth.cancel();isSpeaking=false;
-    if(recognition)try{recognition.stop();}catch(x){}
-    recognition=null;lockMic(300);setMode(MODES.STANDBY);
+    synth.cancel(); isSpeaking=false;
+    if(_activeRec){try{_activeRec.abort();}catch(x){} _activeRec=null;}
+    if(_interimEl){_interimEl.remove();_interimEl=null;}
+    setBusy(300); setMode(MODES.STANDBY);
   }
 });
 
@@ -793,12 +858,33 @@ async function loadDashboard(){
 // ─── INIT ─────────────────────────────────────────
 async function init(){
   await loadStatus();
-  loadWeather();loadEmails();loadCalendar();loadNews();loadDashboard();
-  setTimeout(()=>{
-    const mem=loadMemory();
-    speak(mem.lastSeen?'Welcome back, '+USER_NAME+'. All systems are online.':'J.A.R.V.I.S. online, '+USER_NAME+'. All systems nominal.');
-    mem.lastSeen=new Date().toISOString();saveMemory(mem);
-  },1200);
+  // Fire all loaders in parallel, wait 3.5s so data arrives before briefing
+  await Promise.all([loadWeather(),loadEmails(),loadCalendar(),loadNews(),loadDashboard()]);
+  const mem=loadMemory();
+  mem.lastSeen=new Date().toISOString();saveMemory(mem);
+  // Generate a real morning briefing from live data
+  setTimeout(async()=>{
+    try{
+      const now=new Date();
+      const hour=now.getHours();
+      const greeting=hour<12?'Good morning':hour<17?'Good afternoon':'Good evening';
+      const wCtx=weatherCache?weatherCache.temp+'°C, '+weatherCache.condition+', humidity '+weatherCache.humidity+'%':'weather unavailable';
+      const eCtx=emailCache.length?emailCache.length+' unread emails — latest from '+extractName(emailCache[0]?.from)+': "'+emailCache[0]?.subject+'"':'no unread emails';
+      const calCtx=calCache.length?calCache.map(e=>e.start+' '+e.title).join('; '):'no calendar events today';
+      const dashCtx=dashCache?.connected?'Tasks: '+(dashCache.data?.pending??'unknown')+' pending, '+(dashCache.data?.overdue??0)+' overdue. Meetings today: '+(dashCache.data?.meetings??'unknown'):'Review dashboard not connected';
+      const briefPrompt=greeting+', '+USER_NAME+'. Today is '+now.toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long'})+'. '
+        +'Please give me a crisp intelligence briefing (under 90 words, spoken style, no bullet points) covering: weather ('+wCtx+'), emails ('+eCtx+'), calendar ('+calCtx+'), and work status ('+dashCtx+'). '
+        +'End with one line of motivation or a relevant quote. Address me as Sir.';
+      const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({query:briefPrompt,history:[],memory:[],weatherCtx:wCtx,emailCtx:eCtx,calendarCtx:calCtx,dashCtx:dashCtx})});
+      const data=await r.json();
+      const brief=data.response||'J.A.R.V.I.S. online, Sir. All systems nominal.';
+      appendMsg('jarvis',brief);
+      speak(brief);
+    }catch{
+      speak('J.A.R.V.I.S. online, Sir. All systems nominal. Ready for your commands.');
+    }
+  },3500);
 }
 setInterval(loadWeather,600000);setInterval(loadEmails,120000);
 setInterval(loadCalendar,900000);setInterval(loadNews,1800000);setInterval(loadDashboard,300000);

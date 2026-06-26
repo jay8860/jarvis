@@ -317,21 +317,27 @@ const DASH_HEADERS = {
 };
 
 // Debug endpoint — visit /api/debug-dashboard to see raw API responses
+// Tests both /api/ prefix (correct for SPA backends) and no-prefix paths
 app.get('/api/debug-dashboard', async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
   const endpoints = [
-    '/stats', '/tasks/', '/tasks/?status=Pending,In_Progress',
-    '/tasks/?status=Pending%2CIn_Progress', '/meetings', `/meetings?date=${today}`,
-    '/departments/', '/sessions', '/planner/', '/drafts',
+    // With /api/ prefix (most likely correct for React SPA + Express)
+    '/api/stats', '/api/tasks/', '/api/tasks/?status=Pending,In_Progress',
+    '/api/meetings', `/api/meetings?date=${today}`,
+    // Without prefix (old attempts — all returned HTML)
+    '/stats', '/tasks/', '/meetings',
+    // Other possible patterns
+    '/api/tasks?status=Pending', '/api/v1/stats',
   ];
   const results = {};
   for (const ep of endpoints) {
     try {
       const r = await axios.get(DASH_BASE + ep, { timeout:5000, headers:DASH_HEADERS });
-      results[ep] = { status:r.status, type:typeof r.data, isArray:Array.isArray(r.data),
+      const isHTML = typeof r.data === 'string' && r.data.trim().startsWith('<!');
+      results[ep] = { status:r.status, type:typeof r.data, isHTML, isArray:Array.isArray(r.data),
         length:Array.isArray(r.data)?r.data.length:null,
-        keys:typeof r.data==='object'?Object.keys(r.data||{}).slice(0,10):null,
-        sample: JSON.stringify(r.data).slice(0,300) };
+        keys:typeof r.data==='object'&&!isHTML?Object.keys(r.data||{}).slice(0,10):null,
+        sample: JSON.stringify(r.data).slice(0,200) };
     } catch(e) { results[ep] = { error: e.message, status: e.response?.status }; }
   }
   res.json(results);
@@ -339,16 +345,25 @@ app.get('/api/debug-dashboard', async (req, res) => {
 
 app.get('/api/dashboard-data', async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
+  // Helper: returns true if response is valid JSON (not SPA HTML)
+  const isValidJSON = d => typeof d !== 'string' || !d.trim().startsWith('<!');
   try {
     const [statsRes, tasksRes, meetingsRes] = await Promise.allSettled([
-      axios.get(`${DASH_BASE}/stats`,                              { timeout:7000, headers:DASH_HEADERS }),
-      axios.get(`${DASH_BASE}/tasks/?status=Pending,In_Progress`, { timeout:7000, headers:DASH_HEADERS }),
-      axios.get(`${DASH_BASE}/meetings`,                          { timeout:7000, headers:DASH_HEADERS }),
+      axios.get(`${DASH_BASE}/api/stats`,                              { timeout:7000, headers:DASH_HEADERS }),
+      axios.get(`${DASH_BASE}/api/tasks/?status=Pending,In_Progress`, { timeout:7000, headers:DASH_HEADERS }),
+      axios.get(`${DASH_BASE}/api/meetings`,                          { timeout:7000, headers:DASH_HEADERS }),
     ]);
 
-    const stats    = statsRes.status    === 'fulfilled' ? statsRes.value.data    : null;
-    const tasks    = tasksRes.status    === 'fulfilled' ? tasksRes.value.data    : null;
-    const meetings = meetingsRes.status === 'fulfilled' ? meetingsRes.value.data : null;
+    const getRaw = (r) => {
+      if (r.status !== 'fulfilled') return null;
+      const d = r.value.data;
+      // Reject HTML (SPA catch-all) — only accept JSON
+      if (typeof d === 'string' && d.trim().startsWith('<!')) return null;
+      return d;
+    };
+    const stats    = getRaw(statsRes);
+    const tasks    = getRaw(tasksRes);
+    const meetings = getRaw(meetingsRes);
 
     // Normalise various response shapes
     const toList = d => Array.isArray(d)?d:(d?.results||d?.data||d?.tasks||d?.items||[]);
@@ -362,12 +377,14 @@ app.get('/api/dashboard-data', async (req, res) => {
     const done    = stats?.completed ?? stats?.done ?? stats?.total_completed ?? stats?.total_done ?? '--';
     const mtgs    = stats?.meetings_today ?? meetingList.length;
 
+    const anyData = stats !== null || tasks !== null || meetings !== null;
     res.json({
-      connected: true,
-      data: { pending, overdue, done, meetings:mtgs,
+      connected: anyData,
+      note: anyData ? null : 'Review Dashboard API is returning HTML for all /api/* paths — check /api/debug-dashboard for details',
+      data: anyData ? { pending, overdue, done, meetings:mtgs,
         raw: { statsKeys:Object.keys(stats||{}), taskCount:taskList.length, meetingCount:meetingList.length,
           statsSample: JSON.stringify(stats).slice(0,200) }
-      }
+      } : null
     });
   } catch (err) {
     console.error('[Dashboard]', err.message);
